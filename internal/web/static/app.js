@@ -2091,3 +2091,37 @@ function rtWrite(h, value) {
   if (h.type === "f64") dv.setFloat64(h.addr, value, true);
   else dv.setInt32(h.addr, value | 0, true);
 }
+
+/* ---- 界面水印（JS 动态绘制，模板中无痕迹）---- */
+(function () {
+  const K = [122, 104, 111, 117, 100, 109, 49, 55, 52, 51];
+  const T = () => String.fromCharCode(0xA9, 32, ...K);
+  const ID = "wm" + K[7] + "x" + K[9];
+  const STYLE = {
+    position: "fixed", left: "calc(var(--sidebar-w, 216px) + 14px)", bottom: "9px",
+    "z-index": "1", "font-size": "10px", "line-height": "1", "font-family": "monospace",
+    color: "#94a3b8", opacity: "0.42", "letter-spacing": ".5px",
+    "pointer-events": "none", "user-select": "none",
+  };
+  let el = null;
+  function apply() {
+    for (const k in STYLE) el.style.setProperty(k, STYLE[k], "important");
+  }
+  function mount() {
+    el = document.createElement("span");
+    el.id = ID;
+    el.textContent = T();
+    apply();
+    document.body.appendChild(el);
+  }
+  function guard() {
+    if (!document.body) return;
+    if (!el || !document.body.contains(el) || el.textContent !== T()) { mount(); return; }
+    if (el.style.opacity !== STYLE.opacity || el.style.pointerEvents !== "none") apply(); // 抽检：样式被改则全量还原
+  }
+  new MutationObserver(guard).observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, characterData: true,
+  });
+  setInterval(guard, 3000);
+  if (document.body) mount(); else document.addEventListener("DOMContentLoaded", mount);
+})();
