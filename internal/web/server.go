@@ -3,6 +3,7 @@ package web
 
 import (
 	"bytes"
+	"compress/gzip"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -139,6 +140,9 @@ func Serve(addr string) error {
 		writeOK(w, map[string]any{"bytes": bytes, "requests": reqs})
 	})
 
+	// 内嵌 Ruffle（gzip 预压缩，本地分发，离线可用、秒级加载）
+	mux.HandleFunc("GET /vendor/ruffle/{file}", serveRuffle)
+
 	// 静态资源去掉 static/ 前缀，使 / 直接指向首页；
 	// no-cache 强制按 ETag 协商缓存，避免升级后浏览器拿旧版页面/脚本
 	staticSub, _ := fs.Sub(staticFS, "static")
@@ -154,6 +158,49 @@ func noCache(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-cache")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ---- 内嵌 Ruffle 分发 ----
+
+// ruffleFiles 为允许分发的文件名白名单（gzip 预压缩形态存于 embed）。
+var ruffleFiles = map[string]string{
+	"ruffle.js":                           "text/javascript; charset=utf-8",
+	"core.ruffle.c80159b526e567babaf5.js": "text/javascript; charset=utf-8",
+	"core.ruffle.f000070ea72f8ae4fe3a.js": "text/javascript; charset=utf-8",
+	"72a20ef1c0b8ceb37720.wasm":           "application/wasm",
+	"826bb0938097485a2c9d.wasm":           "application/wasm",
+}
+
+// serveRuffle 分发内嵌的 Ruffle 自托管文件（static/vendor/ruffle/*.gz）。
+// 客户端支持 gzip 时直接透传预压缩字节（零 CPU 开销）；
+// 否则现场解压兜底。no-cache 协商缓存，版本随二进制升级即失效。
+func serveRuffle(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("file")
+	ctype, ok := ruffleFiles[name]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	raw, err := fs.ReadFile(staticFS, "static/vendor/ruffle/"+name+".gz")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Cache-Control", "no-cache")
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+		_, _ = w.Write(raw)
+		return
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "解压失败")
+		return
+	}
+	defer zr.Close()
+	_, _ = io.Copy(w, zr)
 }
 
 // ---- 运行时：本地路径载入 ----

@@ -8,77 +8,117 @@
 /* ---- WASM 内存捕获（必须在加载 Ruffle 之前安装）----
    挂钩 WebAssembly 实例化与 Memory 构造，收集页面上出现过的所有线性内存，
    运行时模式的扫描器直接在这些内存里搜值/写值。 */
-  (function installWasmHooks() {
-    if (window.__wasmMemories) return;
-    const memories = new Set();
-    window.__wasmMemories = memories;
-    const OrigMemory = WebAssembly.Memory;
-    const HookedMemory = function (...args) {
-      const m = new OrigMemory(...args);
-      memories.add(m);
-      return m;
-    };
-    HookedMemory.prototype = OrigMemory.prototype;
-    Object.setPrototypeOf(HookedMemory, OrigMemory);
-    WebAssembly.Memory = HookedMemory;
+(function installWasmHooks() {
+  if (window.__wasmMemories) return;
+  const memories = new Set();
+  window.__wasmMemories = memories;
+  const OrigMemory = WebAssembly.Memory;
+  const HookedMemory = function (...args) {
+    const m = new OrigMemory(...args);
+    memories.add(m);
+    return m;
+  };
+  HookedMemory.prototype = OrigMemory.prototype;
+  Object.setPrototypeOf(HookedMemory, OrigMemory);
+  WebAssembly.Memory = HookedMemory;
 
-    function collect(result) {
-      try {
-        const inst = result && result.instance;
-        if (inst && inst.exports) {
-          for (const k in inst.exports) {
-            const v = inst.exports[k];
-            if (v instanceof OrigMemory) memories.add(v);
-          }
+  function collect(result) {
+    try {
+      const inst = result && result.instance;
+      if (inst && inst.exports) {
+        for (const k in inst.exports) {
+          const v = inst.exports[k];
+          if (v instanceof OrigMemory) memories.add(v);
         }
-      } catch (e) { /* 忽略收集失败 */ }
-      return result;
-    }
-    const origInst = WebAssembly.instantiate;
-    WebAssembly.instantiate = function (...args) {
-      const r = origInst.apply(WebAssembly, args);
-      if (r && typeof r.then === "function") return r.then(collect);
-      return collect(r);
-    };
-    if (WebAssembly.instantiateStreaming) {
-      const origS = WebAssembly.instantiateStreaming;
-      WebAssembly.instantiateStreaming = function (...args) {
-        return origS.apply(WebAssembly, args).then(collect);
-      };
-    }
-  })();
-
-/* ---- Ruffle 惰性加载（CDN；离线时试玩不可用）---- */
-let ruffleLoading = null;
-
-/* ---- Ruffle 控制台环形缓冲：检测资源加载失败并给出指引 ---- */
-window.__rtLog = [];
-(() => {
-  for (const m of ["log", "info", "warn", "error"]) {
-    const orig = console[m].bind(console);
-    console[m] = (...a) => {
-      try {
-        window.__rtLog.push(a.map(x => String(x)).join(" "));
-        if (window.__rtLog.length > 60) window.__rtLog.shift();
-      } catch (e) { /* 忽略 */ }
-      orig(...a);
+      }
+    } catch (e) { /* 忽略收集失败 */ }
+    return result;
+  }
+  const origInst = WebAssembly.instantiate;
+  WebAssembly.instantiate = function (...args) {
+    const r = origInst.apply(WebAssembly, args);
+    if (r && typeof r.then === "function") return r.then(collect);
+    return collect(r);
+  };
+  if (WebAssembly.instantiateStreaming) {
+    const origS = WebAssembly.instantiateStreaming;
+    WebAssembly.instantiateStreaming = function (...args) {
+      return origS.apply(WebAssembly, args).then(collect);
     };
   }
 })();
 
+/* ---- Ruffle 加载：本地内嵌优先（秒开、离线可用），CDN 兜底 ---- */
+let ruffleLoading = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => { ruffleLoading = null; reject(new Error("Ruffle 加载失败: " + src)); };
+    document.head.appendChild(s);
+  });
+}
+
 function loadRuffle() {
   if (window.RufflePlayer) return Promise.resolve();
   if (!ruffleLoading) {
-    ruffleLoading = new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = "https://cdn.jsdelivr.net/npm/@ruffle-rs/ruffle";
-      s.onload = () => setTimeout(resolve, 80); // 等待内部注册
-      s.onerror = () => { ruffleLoading = null; reject(new Error("Ruffle CDN 加载失败（当前离线？）")); };
-      document.head.appendChild(s);
-    });
+    ruffleLoading = loadScript("/vendor/ruffle/ruffle.js")
+      .catch(() => {
+        console.warn("[swfkit] 本地 Ruffle 不可用，回退 CDN");
+        return loadScript("https://cdn.jsdelivr.net/npm/@ruffle-rs/ruffle");
+      })
+      .then(() => new Promise(r => setTimeout(r, 80))); // 等待内部注册
   }
   return ruffleLoading;
 }
+
+/* ---- Ruffle 控制台环形缓冲：仅在游戏加载窗口期启用，检测资源加载失败。
+   检测完成后恢复原始 console，运行期零开销（Ruffle/AS trace 高频日志不再被拦截）。---- */
+window.__rtLog = [];
+const __origConsole = {};
+let __consoleHooked = false;
+
+function hookConsole() {
+  if (__consoleHooked) return;
+  __consoleHooked = true;
+  window.__rtLog.length = 0;
+  for (const m of ["log", "info", "warn", "error"]) {
+    if (!__origConsole[m]) __origConsole[m] = console[m];
+    console[m] = (...a) => {
+      try {
+        // 快速路径：单字符串参数直接存，避免 map+join 的逐次拼接开销
+        const s = a.length === 1 && typeof a[0] === "string"
+          ? a[0]
+          : a.map(x => String(x)).join(" ");
+        window.__rtLog.push(s);
+        if (window.__rtLog.length > 60) window.__rtLog.shift();
+      } catch (e) { /* 忽略 */ }
+      __origConsole[m].apply(console, a);
+    };
+  }
+}
+
+function unhookConsole() {
+  if (!__consoleHooked) return;
+  __consoleHooked = false;
+  for (const m of ["log", "info", "warn", "error"]) {
+    if (__origConsole[m]) console[m] = __origConsole[m];
+  }
+}
+
+/* ---- 零延迟任务让出：MessageChannel（setTimeout(0) 有 ~4ms 嵌套钳制，
+   扫描大内存时让出开销是卡顿主因之一；scheduler.yield 优先）---- */
+const yieldTask = (() => {
+  if (window.scheduler && typeof window.scheduler.yield === "function") {
+    return () => window.scheduler.yield();
+  }
+  const ch = new MessageChannel();
+  const queue = [];
+  ch.port1.onmessage = () => { const r = queue.shift(); if (r) r(); };
+  return () => new Promise(r => { queue.push(r); ch.port2.postMessage(0); });
+})();
 
 /* ---- 修改表：以游戏内容哈希为钥匙的持久化清单 ---- */
 function fnvKey(u8) {
@@ -120,16 +160,13 @@ function chainWrite(m, chain, v) {
 }
 
 /* ---- 指针扫描：反向查找“谁指向这个地址”，构建稳定指针链 ---- */
-const sleep0 = () => new Promise(r => setTimeout(r, 0));
-
 async function rtPointerScan(m, targetAddr, opts = {}) {
   const report = opts.onProgress || (() => {});
   const maxOff = opts.maxOff ?? 0x1000;   // 结构字段偏移上限
   const maxDepth = opts.maxDepth ?? 2;    // 链深度（2 = 根槽 → 结构槽 → 目标）
-  const size = m.buffer.byteLength;
   const u32 = new Uint32Array(m.buffer);
   report("指针扫描：第 1 层…");
-  await new Promise(r => setTimeout(r, 0));
+  await yieldTask();
 
   // 层 1：值域 [T - maxOff, T] 的槽位（指向含目标字段的结构）
   let slots = [];      // { slot, f }  f = T - u32[slot]
@@ -140,11 +177,11 @@ async function rtPointerScan(m, targetAddr, opts = {}) {
       slots.push({ slot: i, f: targetAddr - v });
       if (slots.length >= 50000) break;
     }
-    if ((i & 0x3FFFFF) === 0) await sleep0();
+    if ((i & 0x3FFFFF) === 0) await yieldTask();
   }
   if (!slots.length) return { depth1: [], depth2: [] };
   report(`指针扫描：第 2 层（${slots.length} 个一级槽位）…`);
-  await new Promise(r => setTimeout(r, 0));
+  await yieldTask();
 
   // 层 2：值域覆盖某个层 1 槽位地址的槽位 → 构成二级链
   const sorted = slots.map(s => s.slot).sort((a, b) => a - b);
@@ -163,7 +200,7 @@ async function rtPointerScan(m, targetAddr, opts = {}) {
     const s1 = hit;
     depth2.push({ slots: [i, s1], offs: [s1 - v, slots.find(s => s.slot === s1).f] });
     if (depth2.length >= 2000) break;
-    if ((i & 0x3FFFFF) === 0) { report(`指针扫描：第 2 层 ${depth2.length} 链…`); await sleep0(); }
+    if ((i & 0x3FFFFF) === 0) { report(`指针扫描：第 2 层 ${depth2.length} 链…`); await yieldTask(); }
   }
   return chains;
 }
@@ -347,243 +384,364 @@ const TreeNode = {
 const { createApp, nextTick } = Vue;
 
 const TEMPLATE = `
-<header>
-  <h1>swfkit <span class="sub">Flash 游戏修改器</span></h1>
-  <nav>
-    <button :class="['tab', tab === 'rt' && 'active']" @click="tab = 'rt'">运行时修改</button>
-    <button :class="['tab', tab === 'swf' && 'active']" @click="tab = 'swf'">静态补丁</button>
-    <button :class="['tab', tab === 'sol' && 'active']" @click="tab = 'sol'">SOL 存档</button>
-  </nav>
-</header>
-
-<main>
-  <!-- ============ 运行时修改（内嵌 Ruffle + 内存扫描） ============ -->
-  <section v-show="tab === 'rt'" @dragover.prevent @drop.prevent="rtDrop">
-    <div class="upload-row">
-      <label class="file-btn">📂 {{ rtFile ? rtFile.name : '选择 SWF 文件' }}<input type="file" accept=".swf" @change="onRtFilePicked"></label>
-      <input v-model="rtPath" class="path-input" placeholder="或粘贴本地 .swf 路径（支持游戏目录内的相对资源）" spellcheck="false">
-      <button class="primary" @click="loadMain">载入</button>
-      <button @click="loadDemo('rt')">demo</button>
-      <span class="status" :class="{ err: rtErr }">{{ rtStatus }}</span>
-      <span class="spacer"></span>
-      <button v-show="rtLoaded" @click="rtFullscreen">{{ stageFs ? '⤢ 退出全屏' : '⛶ 全屏' }}</button>
-      <button v-show="rtLoaded" @click="rtStop">结束</button>
-    </div>
-
-    <div class="rt-stage" ref="stage">
-      <div class="player-wrap">
-        <div id="rt-box" ref="rtBox"></div>
-        <div class="load-overlay" v-show="rtLoading">
-          <div class="spinner"></div>
-          <div class="stage">{{ rtLoadStage }}</div>
-          <div class="bar"><div class="bar-in" :class="{ indet: rtLoadPct === null }" :style="{ width: (rtLoadPct ?? 100) + '%' }"></div></div>
-          <div class="bytes" v-if="rtLoadBytes">{{ rtLoadBytes }}</div>
-        </div>
+<div class="shell">
+  <!-- ======== 侧边导航 ======== -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">S</div>
+      <div class="brand-text">
+        <div class="brand-name">swfkit</div>
+        <div class="brand-sub">Flash 游戏修改器</div>
       </div>
+    </div>
+    <nav class="nav">
+      <button :class="['nav-item', tab === 'rt' && 'active']" @click="tab = 'rt'">
+        <span class="nico">▶</span><span class="nlbl">运行时修改</span>
+      </button>
+      <button :class="['nav-item', tab === 'swf' && 'active']" @click="tab = 'swf'">
+        <span class="nico">⚡</span><span class="nlbl">静态补丁</span>
+      </button>
+      <button :class="['nav-item', tab === 'sol' && 'active']" @click="tab = 'sol'">
+        <span class="nico">▤</span><span class="nlbl">SOL 存档</span>
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <button class="nav-item" @click="drawerOpen = !drawerOpen">
+        <span class="nico">⌘</span><span class="nlbl">控制台</span>
+      </button>
+      <div class="sidebar-ver">单二进制本地工具<br>仅供个人学习使用</div>
+    </div>
+  </aside>
 
-      <!-- 悬浮训练器：窗口模式在游戏下方；全屏时悬浮于游戏上方 -->
-      <div class="trainer" v-show="rtLoaded" ref="trainerEl"
-           :style="trainerStyle"
-           @dblclick.self="trainerOpen = !trainerOpen">
-        <div class="trainer-head" @mousedown.prevent="panelDragStart"
-             @dblclick.self="trainerOpen = !trainerOpen">
-          <span class="badge">训练器</span>
-          <span class="tcount">{{ rtCountText }}</span>
-          <span class="spacer"></span>
-          <button @click="rtFullscreen">{{ stageFs ? '⤢ 退出全屏' : '⛶ 全屏' }}</button>
-          <button @click="trainerOpen = !trainerOpen">{{ trainerOpen ? '▴ 收起' : '▾ 面板' }}</button>
-        </div>
-        <div class="trainer-body" v-show="trainerOpen">
-          <div class="scan-info" v-show="rtSearching">{{ rtScanInfo }}</div>
-          <div class="ptabs">
-            <button :class="['ptab', ptTab === 'search' && 'on']" @click="ptTab = 'search'">搜索</button>
-            <button :class="['ptab', ptTab === 'cheats' && 'on']" @click="ptTab = 'cheats'">
-              清单<span v-if="cheats.length"> ·{{ cheats.length }}</span>
-            </button>
+  <!-- ======== 主区 ======== -->
+  <div class="main">
+    <div class="page">
+
+      <!-- ============ 运行时修改（内嵌 Ruffle + 内存扫描） ============ -->
+      <section v-show="tab === 'rt'" @dragover.prevent="rtDragging = true" @dragleave.prevent="rtDragging = false" @drop.prevent="rtDrop">
+        <div class="page-head">
+          <div>
+            <h2 class="page-title">运行时修改</h2>
+            <div class="page-desc">内嵌 Ruffle 直接运行游戏，Cheat Engine 式搜值/写值，即时生效</div>
           </div>
+          <span class="spacer"></span>
+          <span class="badge" v-if="rtLoaded">● 运行中</span>
+          <span class="status" :class="{ err: rtErr }">{{ rtStatus }}</span>
+        </div>
 
-          <!-- 搜索页：CE 式单按钮智能搜索 -->
-          <div class="searchpage" v-show="ptTab === 'search'">
-            <div class="frow">
-              <input class="fin grow" v-model="rtSearchValue" placeholder="数值（留空 = 未知初值扫描）">
-              <select class="fsel" v-model="rtSearchType" style="width:74px; flex:none;" title="数值类型">
-                <option value="auto">自动</option>
-                <option value="f64">f64</option>
-                <option value="i32">i32</option>
-              </select>
+        <div class="card" :class="{ dropzone: true, dragging: rtDragging }">
+          <div class="toolbar">
+            <label class="file-btn" :class="{ 'has-file': rtFile }">📂 {{ rtFile ? rtFile.name : '选择 SWF 文件' }}<input type="file" accept=".swf" ref="rtFileInput" @change="onRtFilePicked"></label>
+            <input v-model="rtPath" class="path-input" placeholder="或粘贴本地 .swf 路径（游戏目录内相对资源完整支持）" spellcheck="false" @keydown.enter="loadMain">
+            <button class="primary" @click="loadMain">载入</button>
+            <button @click="loadDemo('rt')">体验 demo</button>
+            <span class="spacer"></span>
+            <select v-show="rtLoaded" v-model="rtQuality" @change="rtApplyQuality" class="fsel" style="flex:none" title="渲染画质：卡顿时可降低，实时生效">
+              <option value="auto">画质:自动</option>
+              <option value="high">画质:高</option>
+              <option value="medium">画质:中</option>
+              <option value="low">画质:低</option>
+            </select>
+            <button v-show="rtLoaded" @click="rtFullscreen">{{ stageFs ? '⤢ 退出全屏' : '⛶ 全屏' }}</button>
+            <button v-show="rtLoaded" class="danger" @click="rtStop">结束</button>
+          </div>
+          <div class="dim-note" v-if="!rtLoaded">也可以直接把 .swf 文件拖进本页面</div>
+        </div>
+
+        <!-- 未载入：空状态引导 -->
+        <div class="card" v-if="!rtLoaded && !rtLoading">
+          <div class="empty-hero">
+            <div class="hero-ico">🎮</div>
+            <h3>载入一个 Flash 游戏开始</h3>
+            <p>选择本地 .swf 文件——若该文件曾以路径方式载入过，将按「同名 + 同大小」自动定位磁盘真实路径，
+               外挂资源（语言包 / 开场动画等）完整支持；未识别时以文件模式运行。<br>
+               游戏运行后：输入数值 → 搜索 → 游戏内改变它 → 再次搜索，即可定位并改写内存。</p>
+            <div class="hero-actions">
+              <button class="primary" @click="$refs.rtFileInput.click()">选择 SWF 文件</button>
+              <button @click="loadDemo('rt')">体验内置 demo</button>
             </div>
-            <div class="frow">
-              <button class="pbtn primary grow" :class="{ searching: rtSearching }" :disabled="rtSearching" @click="rtSmartSearch">{{ searchBtnText }}</button>
-              <select class="fsel" v-model="rtNarrowMode" style="width:92px; flex:none;"
-                      :disabled="!rtHasHits" title="再次搜索的缩小方式">
-                <option value="exact">精确值</option>
-                <option value="inc">变大了</option>
-                <option value="dec">变小了</option>
-                <option value="changed">变化了</option>
-                <option value="same">没变化</option>
-              </select>
-              <button class="pbtn" style="flex:none" @click="rtResetSearch" title="清空结果，重新开始">重置</button>
+          </div>
+        </div>
+
+        <!-- 舞台 + 训练器 -->
+        <div class="rt-layout" v-show="rtLoaded || rtLoading">
+          <div class="rt-stage-col">
+            <div class="rt-stage" ref="stage">
+              <div class="player-wrap">
+                <div id="rt-box" ref="rtBox"></div>
+                <div class="load-overlay" v-show="rtLoading">
+                  <div class="spinner"></div>
+                  <div class="stage">{{ rtLoadStage }}</div>
+                  <div class="bar"><div class="bar-in" :class="{ indet: rtLoadPct === null }" :style="{ width: (rtLoadPct ?? 100) + '%' }"></div></div>
+                  <div class="bytes" v-if="rtLoadBytes">{{ rtLoadBytes }}</div>
+                </div>
+              </div>
+              <div ref="trainerDockFs"></div>
             </div>
-            <div class="hits-scroll">
-              <table class="hits ttable">
-                <thead><tr><th class="c-ty">类型</th><th class="c-addr">地址</th><th class="c-val">当前值</th><th class="c-add"></th></tr></thead>
-                <tbody>
-                  <tr v-for="(h, i) in rtDisplayHits" :key="h.key" style="cursor:pointer"
-                      title="双击加入修改清单" @dblclick="addCheatFromHit(h)">
-                    <td class="ty"><span class="tybadge">{{ h.type }}</span></td>
-                    <td class="addr">0x{{ h.addr.toString(16) }}</td>
-                    <td class="val" :class="{ err: h.cur === null }">{{ h.cur === null ? '⟲' : h.cur }}</td>
-                    <td class="c-add">
-                      <button class="mini" title="加入修改清单" @click.stop="addCheatFromHit(h)">＋</button>
-                      <button class="mini ptr" title="追踪指针链（地址漂移时用这个）" @click.stop="ptrTrack(h)">🎯</button>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-              <div v-if="!rtHasHits" class="empty">
-                输入数值点「搜索」；游戏里数值变化后再点一次即缩小范围。<br>
-                血条/蓝条等看不见精确值：留空数值直接搜索，再配合上方下拉缩小
+            <div class="warn-note" v-if="rtResWarn" style="margin-top:10px">{{ rtResWarn }}</div>
+          </div>
+          <div class="rt-side-col" v-show="rtLoaded">
+            <div ref="trainerDockWin"></div>
+          </div>
+        </div>
+
+        <!-- 悬浮训练器：窗口模式停靠右侧栏；全屏时 Teleport 进舞台悬浮 -->
+        <Teleport v-if="rtLoaded && trainerTarget" :to="trainerTarget">
+          <div class="trainer" ref="trainerEl" :style="trainerStyle">
+            <div class="trainer-head" @mousedown.prevent="panelDragStart"
+                 @dblclick.self="trainerOpen = !trainerOpen">
+              <span class="tdot"></span>
+              <span class="ttitle">训练器</span>
+              <span class="tcount">{{ rtCountText }}</span>
+              <span class="spacer"></span>
+              <button class="icobtn" @click="rtFullscreen" :title="stageFs ? '退出全屏' : '全屏'">{{ stageFs ? '⤢' : '⛶' }}</button>
+              <button class="icobtn" @click="trainerOpen = !trainerOpen" :title="trainerOpen ? '收起面板' : '展开面板'">{{ trainerOpen ? '▴' : '▾' }}</button>
+            </div>
+            <div class="trainer-body" v-show="trainerOpen">
+              <div class="ptabs">
+                <button :class="['ptab', ptTab === 'search' && 'on']" @click="ptTab = 'search'">搜索</button>
+                <button :class="['ptab', ptTab === 'cheats' && 'on']" @click="ptTab = 'cheats'">
+                  修改清单<span v-if="cheats.length"> · {{ cheats.length }}</span>
+                </button>
+              </div>
+
+              <!-- 搜索页：CE 式单按钮智能搜索 -->
+              <div class="searchpage" v-show="ptTab === 'search'">
+                <div class="frow">
+                  <input class="fin grow" v-model="rtSearchValue" placeholder="数值（留空 = 未知初值扫描）" @keydown.enter="rtSmartSearch">
+                  <select class="fsel" v-model="rtSearchType" style="width:76px; flex:none;" title="数值类型">
+                    <option value="auto">自动</option>
+                    <option value="f64">f64</option>
+                    <option value="i32">i32</option>
+                  </select>
+                </div>
+                <div class="frow">
+                  <button class="pbtn primary grow" :class="{ searching: rtSearching }" :disabled="rtSearching" @click="rtSmartSearch">{{ searchBtnText }}</button>
+                  <select class="fsel" v-model="rtNarrowMode" style="width:94px; flex:none;"
+                          :disabled="!rtHasHits" title="再次搜索的缩小方式">
+                    <option value="exact">精确值</option>
+                    <option value="inc">变大了</option>
+                    <option value="dec">变小了</option>
+                    <option value="changed">变化了</option>
+                    <option value="same">没变化</option>
+                  </select>
+                  <button class="pbtn" style="flex:none" @click="rtResetSearch" title="清空结果，重新开始">重置</button>
+                </div>
+                <div class="scan-info" v-show="rtSearching">{{ rtScanInfo }}</div>
+                <div class="hits-scroll">
+                  <table class="hits ttable">
+                    <thead><tr><th style="width:44px">类型</th><th style="width:88px">地址</th><th>当前值</th><th style="width:64px"></th></tr></thead>
+                    <tbody>
+                      <tr v-for="(h, i) in rtDisplayHits" :key="h.key" style="cursor:pointer"
+                          title="双击加入修改清单" @dblclick="addCheatFromHit(h)">
+                        <td class="ty"><span class="tybadge">{{ h.type }}</span></td>
+                        <td class="addr">0x{{ h.addr.toString(16) }}</td>
+                        <td class="val" :class="{ err: h.cur === null }">{{ h.cur === null ? '⟲' : h.cur }}</td>
+                        <td>
+                          <button class="mini" title="加入修改清单" @click.stop="addCheatFromHit(h)">＋</button>
+                          <button class="mini" title="追踪指针链（地址漂移时用这个）" @click.stop="ptrTrack(h)">🎯</button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <div v-if="!rtHasHits" class="empty">
+                    输入数值点「搜索」；游戏里数值变化后再点一次即缩小范围。<br>
+                    血条/蓝条等看不见精确值：留空数值直接搜索，再配合上方下拉缩小
+                  </div>
+                </div>
+              </div>
+
+              <!-- 修改清单页 -->
+              <div class="panel-scroll" v-show="ptTab === 'cheats'">
+                <table class="ctable">
+                  <thead><tr><th class="k">🔒</th><th>描述</th><th class="v">值</th><th class="op"></th></tr></thead>
+                  <tbody>
+                    <template v-for="c in cheats" :key="c.id">
+                      <tr :class="{ fresh: freshId === c.id, dead: c.cur === null }">
+                        <td class="k"><button :class="['lock', { on: c.lock }]" @click="toggleLock(c)"
+                            :title="c.lock ? '解锁（停止冻结）' : '锁定（冻结当前值）'">{{ c.lock ? '🔒' : '🔓' }}</button></td>
+                        <td><input class="cdesc" v-model="c.desc" placeholder="备注"></td>
+                        <td class="v"><input class="cval-in" :class="{ lockv: c.lock }" :value="c.cur"
+                            @focus="valFocusId = c.id" @blur="writeCheatVal(c, $event)"
+                            @keydown.enter="$event.target.blur()"></td>
+                        <td class="op">
+                          <button class="mini" :class="{ on: cfgId === c.id }" @click="cfgId = cfgId === c.id ? '' : c.id"
+                                  title="步长与热键">⚙</button>
+                          <button class="del" @click="delCheat(c.id)">✕</button>
+                        </td>
+                      </tr>
+                      <tr v-if="cfgId === c.id" class="cfg">
+                        <td class="k"></td>
+                        <td colspan="2">
+                          <div class="cfg-cells">
+                            <label class="hk">步长 <input class="hkin" style="width:56px" v-model.number="c.delta"></label>
+                            <button class="mini" @click="adjustCheat(c, c.delta)">＋{{ c.delta }}</button>
+                            <button class="mini" @click="adjustCheat(c, -c.delta)">－{{ c.delta }}</button>
+                          </div>
+                        </td>
+                        <td class="op">
+                          <span class="cfg-hks">
+                            <input class="hkin" style="width:50px" :value="c.hotkey" @keydown.prevent="setHk(c, 'hotkey', $event)" placeholder="锁键" title="锁定开关热键">
+                            <input class="hkin" style="width:50px" :value="c.hotkeyAdd" @keydown.prevent="setHk(c, 'hotkeyAdd', $event)" placeholder="＋键">
+                            <input class="hkin" style="width:50px" :value="c.hotkeyDec" @keydown.prevent="setHk(c, 'hotkeyDec', $event)" placeholder="－键">
+                          </span>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+                <div v-if="!cheats.length" class="empty">
+                  清单为空：在「搜索」页结果行点「＋」加入地址，<br>然后可 🔒 锁定冻结、⚙ 配置步长与热键
+                </div>
               </div>
             </div>
           </div>
+        </Teleport>
+      </section>
 
-          <!-- 修改清单页 -->
-          <div class="panel-scroll" v-show="ptTab === 'cheats'">
-            <table class="ctable">
-              <thead><tr><th class="k">🔒</th><th>描述</th><th class="v">值</th><th class="op"></th></tr></thead>
-              <tbody>
-                <template v-for="c in cheats" :key="c.id">
-                  <tr :class="{ fresh: freshId === c.id, dead: c.cur === null }">
-                    <td class="k"><button :class="['lock', { on: c.lock }]" @click="toggleLock(c)"
-                        :title="c.lock ? '解锁（停止冻结）' : '锁定（冻结当前值）'">{{ c.lock ? '🔒' : '🔓' }}</button></td>
-                    <td><input class="cdesc" v-model="c.desc" placeholder="备注"></td>
-                    <td class="v"><input class="cval-in" :class="{ lockv: c.lock }" :value="c.cur"
-                        @focus="valFocusId = c.id" @blur="writeCheatVal(c, $event)"
-                        @keydown.enter="$event.target.blur()"></td>
-                    <td class="op">
-                      <button class="mini" :class="{ on: cfgId === c.id }" @click="cfgId = cfgId === c.id ? '' : c.id"
-                              title="步长与热键">⚙</button>
-                      <button class="del" @click="delCheat(c.id)">✕</button>
-                    </td>
-                  </tr>
-                  <tr v-if="cfgId === c.id" class="cfg">
-                    <td class="k"></td>
-                    <td class="cfg-cells" colspan="2">
-                      <label class="hk">步长 <input class="hkin" style="width:56px" v-model.number="c.delta"></label>
-                      <button class="mini" @click="adjustCheat(c, c.delta)">＋{{ c.delta }}</button>
-                      <button class="mini" @click="adjustCheat(c, -c.delta)">－{{ c.delta }}</button>
-                    </td>
-                    <td class="op cfg-hks">
-                      <input class="hkin" style="width:54px" :value="c.hotkey" @keydown.prevent="setHk(c, 'hotkey', $event)" placeholder="锁键" title="锁定开关热键">
-                      <input class="hkin" style="width:54px" :value="c.hotkeyAdd" @keydown.prevent="setHk(c, 'hotkeyAdd', $event)" placeholder="＋键">
-                      <input class="hkin" style="width:54px" :value="c.hotkeyDec" @keydown.prevent="setHk(c, 'hotkeyDec', $event)" placeholder="－键">
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
-            <div v-if="!cheats.length" class="empty">
-              清单为空：在「搜索」页结果行点「＋」加入地址，<br>然后可 🔒 锁定冻结、⚙ 配置步长与热键
+      <!-- ============ 静态补丁工作台 ============ -->
+      <section v-show="tab === 'swf'">
+        <div class="page-head">
+          <div>
+            <h2 class="page-title">静态补丁</h2>
+            <div class="page-desc">解析 SWF 内 ABC 字节码，按数值扫描 push 指令并安全改写，生成补丁文件</div>
+          </div>
+          <span class="spacer"></span>
+          <span class="badge blue" v-if="swfId">rev={{ swfRev }}</span>
+          <span class="status" :class="{ err: swfErr }">{{ swfStatus }}</span>
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <label class="file-btn" :class="{ 'has-file': swfFile }">📂 {{ swfFile ? swfFile.name : '选择 SWF 文件' }}<input type="file" accept=".swf" ref="swfFileInput" @change="e => swfFile = e.target.files[0]"></label>
+            <button class="primary" @click="uploadSwf">上传解析</button>
+            <button @click="loadDemo('swf')">试用内置 demo</button>
+          </div>
+        </div>
+
+        <div class="card" v-if="!swfId">
+          <div class="empty-hero">
+            <div class="hero-ico">⚡</div>
+            <h3>上传 SWF 开始静态补丁</h3>
+            <p>直接改写字节码中的数值常量（金币初始值、伤害倍率等），生成可下载的补丁后 SWF。<br>
+               支持常量池追加 + 指令重定向、窄指令升位、跳转与异常偏移自动重映射，精确到 类名::方法名。</p>
+            <div class="hero-actions">
+              <button class="primary" @click="$refs.swfFileInput.click()">选择 SWF 文件</button>
+              <button @click="loadDemo('swf')">试用内置 demo</button>
             </div>
           </div>
         </div>
-      </div>
-    </div>
-  </section>
 
-  <!-- ============ 静态补丁工作台 ============ -->
-  <section v-show="tab === 'swf'">
-    <div class="upload-row">
-      <label class="file-btn">📂 {{ swfFile ? swfFile.name : '选择 SWF 文件' }}<input type="file" accept=".swf" @change="e => swfFile = e.target.files[0]"></label>
-      <button class="primary" @click="uploadSwf">上传解析</button>
-      <button @click="loadDemo('swf')">试用内置 demo</button>
-      <span class="status" :class="{ err: swfErr }">{{ swfStatus }}</span>
-    </div>
+        <div class="card" v-show="swfId">
+          <div class="card-title">文件信息 <span class="hint">DoABC 模块统计</span></div>
+          <div class="info-line">{{ swfSummary }}</div>
+          <div v-for="(m, i) in swfModules" :key="i" class="mod-line">{{ modText(m) }}</div>
+        </div>
 
-    <div class="card" v-show="swfId">
-      <div class="info-line">{{ swfSummary }}</div>
-      <div v-for="(m, i) in swfModules" :key="i" class="mod-line">{{ modText(m) }}</div>
-    </div>
+        <div class="card scan-row" v-show="swfId">
+          <label>当前值 <input v-model="swfScanValue" placeholder="如 100 / 3.14 / 0xFF" @keydown.enter="doScan(false)"></label>
+          <label>口径
+            <select v-model="swfScanMode">
+              <option value="any">全部</option>
+              <option value="int">整型</option>
+              <option value="uint">无符号</option>
+              <option value="double">浮点</option>
+            </select>
+          </label>
+          <button class="primary" @click="doScan(false)">扫描</button>
+          <button @click="doScan(true)" :disabled="!swfHits.length">二次缩小</button>
+          <span class="spacer"></span>
+          <label>新值 <input v-model="swfNewValue" placeholder="99999" @keydown.enter="applyChecked"></label>
+          <button class="primary" @click="applyChecked">应用所选</button>
+          <button @click="undoSwf" :disabled="swfRev === 0" title="回滚上一次补丁">↩ 撤销</button>
+          <a v-if="swfDownloadUrl" class="button" :href="swfDownloadUrl">⬇ 下载补丁后 SWF</a>
+          <button @click="playStatic">▶ 试玩当前版本</button>
+        </div>
 
-    <div class="scan-row card" v-show="swfId">
-      <label>当前值 <input v-model="swfScanValue" placeholder="如 100 / 3.14 / 0xFF"></label>
-      <label>口径
-        <select v-model="swfScanMode">
-          <option value="any">全部</option>
-          <option value="int">整型</option>
-          <option value="uint">无符号</option>
-          <option value="double">浮点</option>
-        </select>
-      </label>
-      <button class="primary" @click="doScan(false)">扫描</button>
-      <button @click="doScan(true)">二次缩小</button>
-      <span class="spacer"></span>
-      <label>新值 <input v-model="swfNewValue" placeholder="99999"></label>
-      <button class="primary" @click="applyChecked">应用所选</button>
-      <a v-if="swfDownloadUrl" class="button" :href="swfDownloadUrl">下载补丁后 SWF</a>
-      <button @click="playStatic">▶ 试玩当前版本</button>
-    </div>
+        <div class="card" v-show="swfHits.length">
+          <div class="hits-head"><span class="status">{{ hitSummary }}</span></div>
+          <div class="hits-scroll" style="max-height:420px">
+            <table class="hits">
+              <thead><tr><th style="width:30px"></th><th style="width:36px">#</th><th style="width:110px">来源</th><th style="width:90px">值</th><th>位置</th><th>字符串提示</th></tr></thead>
+              <tbody>
+                <tr v-for="(h, i) in swfDisplayHits" :key="i">
+                  <td><input type="checkbox" v-model="h.checked"></td>
+                  <td>{{ i + 1 }}</td>
+                  <td class="src">{{ h.source }}</td>
+                  <td class="val">{{ h.value }}</td>
+                  <td class="where">{{ h.where }}</td>
+                  <td class="hints">{{ (h.hints || []).join(', ') }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
 
-    <div class="card" v-show="swfHits.length">
-      <div class="hits-head"><span class="status">{{ hitSummary }}</span></div>
-      <div class="hits-scroll" style="max-height:420px">
-      <table class="hits">
-        <thead><tr><th></th><th>#</th><th>来源</th><th>值</th><th>位置</th><th>字符串提示</th></tr></thead>
-        <tbody>
-          <tr v-for="(h, i) in swfDisplayHits" :key="i">
-            <td><input type="checkbox" v-model="h.checked"></td>
-            <td>{{ i + 1 }}</td>
-            <td class="src">{{ h.source }}</td>
-            <td class="val">{{ h.value }}</td>
-            <td class="where">{{ h.where }}</td>
-            <td class="hints">{{ (h.hints || []).join(', ') }}</td>
-          </tr>
-        </tbody>
-      </table>
-      </div>
-    </div>
+        <div class="card" v-show="playerVisible">
+          <div class="hits-head">
+            <span class="badge blue">Ruffle 试玩</span>
+            <span class="status">rev={{ swfRev }}</span>
+            <span class="spacer"></span>
+            <button class="small" @click="playStatic">⟳ 载入最新补丁</button>
+            <button class="small" @click="playerVisible = false">收起</button>
+          </div>
+          <div class="player-wrap" style="margin-top:8px"><div id="player-box" ref="playerBox"></div></div>
+          <p class="dim-note">试玩基于内嵌 Ruffle（WebAssembly Flash 模拟器，本地分发，离线可用）。
+          补丁后点「载入最新补丁」重开游戏即可看到效果。</p>
+        </div>
+      </section>
 
-    <div class="card" v-show="playerVisible">
-      <div class="hits-head">
-        <span class="badge">Ruffle 试玩</span>
-        <span class="status">rev={{ swfRev }}</span>
-        <span class="spacer"></span>
-        <button @click="playStatic">⟳ 载入最新补丁</button>
-        <button @click="playerVisible = false">收起</button>
-      </div>
-      <div id="player-box" ref="playerBox"></div>
-      <p class="dim-note">试玩基于 Ruffle（WebAssembly Flash 模拟器，经 CDN 加载，离线时不可用）。
-      补丁后点「载入最新补丁」重开游戏即可看到效果。</p>
-    </div>
-  </section>
+      <!-- ============ SOL 编辑器 ============ -->
+      <section v-show="tab === 'sol'">
+        <div class="page-head">
+          <div>
+            <h2 class="page-title">SOL 存档编辑</h2>
+            <div class="page-desc">解析 Flash 本地共享对象（AMF0/AMF3），点值即改，下载替换存档</div>
+          </div>
+          <span class="spacer"></span>
+          <span class="status" :class="{ err: solErr }">{{ solStatus }}</span>
+        </div>
 
-  <!-- ============ SOL 编辑器 ============ -->
-  <section v-show="tab === 'sol'">
-    <div class="upload-row">
-      <label class="file-btn">📂 {{ solFile ? solFile.name : '选择 SOL 文件' }}<input type="file" accept=".sol" @change="e => solFile = e.target.files[0]"></label>
-      <button class="primary" @click="uploadSol">上传解析</button>
-      <button @click="loadDemo('sol')">试用内置 demo</button>
-      <span class="status" :class="{ err: solErr }">{{ solStatus }}</span>
-      <span class="spacer"></span>
-      <input v-model="solSearch" placeholder="过滤路径 / 值…">
-      <a v-if="solDownloadUrl" class="button" :href="solDownloadUrl">下载 .sol</a>
-    </div>
-    <div class="card tree">
-      <tree-node v-if="solTree" name="(root)" :value="solTree" path="" :filter="solSearch" @edit="solEdit" />
-    </div>
-  </section>
-</main>
+        <div class="card">
+          <div class="toolbar">
+            <label class="file-btn" :class="{ 'has-file': solFile }">📂 {{ solFile ? solFile.name : '选择 SOL 文件' }}<input type="file" accept=".sol" ref="solFileInput" @change="e => solFile = e.target.files[0]"></label>
+            <button class="primary" @click="uploadSol">上传解析</button>
+            <button @click="loadDemo('sol')">试用内置 demo</button>
+            <span class="spacer"></span>
+            <input v-model="solSearch" placeholder="过滤路径 / 值…" style="width:200px">
+            <a v-if="solDownloadUrl" class="button primary" :href="solDownloadUrl">⬇ 下载 .sol</a>
+          </div>
+        </div>
 
-<footer>仅用于本地单机游戏存档/资源的个人修改 · 补丁会话在服务重启后失效</footer>
+        <div class="card" v-if="!solId">
+          <div class="empty-hero">
+            <div class="hero-ico">▤</div>
+            <h3>上传 .sol 存档开始编辑</h3>
+            <p>Flash 游戏的本地存档（通常位于浏览器或 Flash Player 的共享对象目录）。<br>
+               支持 AMF0/AMF3、ByteArray、Date、ECMA 数组、typed object，键序保持、JSON 往返。</p>
+            <div class="hero-actions">
+              <button class="primary" @click="$refs.solFileInput.click()">选择 SOL 文件</button>
+              <button @click="loadDemo('sol')">试用内置 demo</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card tree" v-if="solTree">
+          <tree-node name="(root)" :value="solTree" path="" :filter="solSearch" @edit="solEdit" />
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
 
 <!-- 控制台抽屉 -->
 <div :class="['drawer', { open: drawerOpen }]">
   <div class="drawer-head" @click="drawerOpen = !drawerOpen">
-    <span class="badge">控制台</span>
+    <span class="badge blue">控制台</span>
     <span class="status">{{ modeText }}</span>
     <span class="spacer"></span>
-    <button @click.stop="conLines = []">清空</button>
-    <button @click.stop="drawerOpen = !drawerOpen">{{ drawerOpen ? '▾' : '▴' }}</button>
+    <button class="small" @click.stop="conLines = []">清空</button>
+    <button class="small" @click.stop="drawerOpen = !drawerOpen">{{ drawerOpen ? '▾ 收起' : '▴ 展开' }}</button>
   </div>
   <div class="console-log" ref="conLog">
     <div v-for="(l, i) in conLines" :key="i" :class="'ln-' + l.cls">{{ l.text }}</div>
@@ -631,12 +789,10 @@ const app = createApp({
       rtMemMB: 0,
       rtStatus: "",
       rtErr: false,
-      rtHits: null,
       rtNarrowMode: "exact",
-      editCheatId: "",
-      editVal: "",
       rtTick: 0,
       trainerOpen: true,
+      trainerTarget: null,
       stageFs: false,
       rtSearching: false,
       rtScanInfo: "",
@@ -647,6 +803,8 @@ const app = createApp({
       rtLoadPct: null,
       rtLoadBytes: "",
       rtResWarn: "",
+      rtDragging: false,
+      rtQuality: "auto",
       rtSearchValue: "",
       rtSearchType: "auto",
       cheats: [],
@@ -656,6 +814,7 @@ const app = createApp({
       ptTab: "search",
       rtObjectUrl: null,
       rtPlayer: null,
+      gameKey: "",
 
       // 静态补丁
       swfFile: null,
@@ -712,7 +871,7 @@ const app = createApp({
       return this.swfHits.slice(0, SWF_DISPLAY_CAP);
     },
     trainerStyle() {
-      if (!this.stageFs) return null; // 窗口模式：普通卡片
+      if (!this.stageFs) return null; // 窗口模式：停靠右侧栏
       const s = {};
       if (this.panelPos) {
         s.left = this.panelPos.x + "px";
@@ -726,7 +885,6 @@ const app = createApp({
     },
     rtHasHits() {
       void this.rtTick; // 未知初值扫描为非响应式存储，靠 tick 驱动刷新
-      if (rtState.unknown) return rtState.unknown.total > 0;
       if (rtState.unknown) return rtState.unknown.total > 0;
       return rtState.hits !== null && rtState.hits.length > 0;
     },
@@ -784,6 +942,10 @@ const app = createApp({
       if (rtState.hits.length >= RT_HIT_CAP) t += " · 已达截断上限，建议用更独特的值";
       return t;
     },
+  },
+  watch: {
+    stageFs() { this.syncTrainerDock(); },
+    rtLoaded() { this.syncTrainerDock(); },
   },
   methods: {
     /* ---- 控制台 ---- */
@@ -925,6 +1087,19 @@ const app = createApp({
         this.swfStatus = "失败: " + e.message;
       }
     },
+    async undoSwf() {
+      if (!this.swfId) return;
+      try {
+        const res = await api("POST", `/api/swf/${this.swfId}/undo`, {});
+        this.swfRev = res.rev;
+        this.swfHits = [];
+        this.clog(`已回滚到 rev=${res.rev}，命中列表已清空`, "ok");
+        this.showToast("已撤销上一次补丁", "ok");
+      } catch (e) {
+        this.swfErr = true;
+        this.swfStatus = "失败: " + e.message;
+      }
+    },
     async playStatic() {
       if (!this.swfId) throw new Error("未加载 SWF");
       this.clog("启动 Ruffle 试玩…", "dim");
@@ -935,7 +1110,7 @@ const app = createApp({
       box.innerHTML = "";
       const player = window.RufflePlayer.newest().createPlayer();
       box.appendChild(player);
-      await player.load({ url: `/api/swf/${this.swfId}/raw?rev=${this.swfRev}`, allowScriptAccess: false });
+      await player.load(this.playerOpts({ url: `/api/swf/${this.swfId}/raw?rev=${this.swfRev}` }));
       this.clog(`已载入 rev=${this.swfRev}。补丁后点「载入最新补丁」重开游戏。`, "ok");
     },
 
@@ -974,6 +1149,7 @@ const app = createApp({
       if (this.rtFile) this.rtSmartLoad(); // 选完即载入
     },
     rtDrop(e) {
+      this.rtDragging = false;
       const f = e.dataTransfer?.files?.[0];
       if (!f || !/\.swf$/i.test(f.name)) { this.clog("请拖入 .swf 文件", "dim"); return; }
       this.rtFile = f;
@@ -1033,6 +1209,13 @@ const app = createApp({
         this.clog("错误: " + e.message, "err");
       }
     },
+    /* 训练器停靠：窗口模式 → 右侧栏；全屏 → 舞台内悬浮 */
+    syncTrainerDock() {
+      nextTick(() => {
+        const target = this.stageFs ? this.$refs.trainerDockFs : this.$refs.trainerDockWin;
+        if (target) this.trainerTarget = target;
+      });
+    },
     panelDragStart(e) {
       if (!this.stageFs) return; // 窗口模式无需拖动
       if (e.target.closest("button, input, select")) return;
@@ -1069,12 +1252,46 @@ const app = createApp({
         this.clog("全屏失败: " + e.message, "err");
       }
     },
+    /* Ruffle 播放器配置：性能相关项显式固定，画质可被用户设置覆盖 */
+    playerOpts(extra) {
+      const opts = {
+        allowScriptAccess: false,
+        logLevel: "error",          // 抑制模拟器日志（AS trace 仍会走 console，由 hook 生命周期管控）
+        letterbox: "fullscreen",    // 仅全屏加黑边，窗口模式铺满
+        scale: "showAll",
+        wmode: "window",            // 合成开销最低的窗口模式
+        publicPath: "/vendor/ruffle/",
+        autoplay: "on",
+        contextMenu: "off",
+        ...extra,
+      };
+      if (this.rtQuality && this.rtQuality !== "auto") opts.quality = this.rtQuality;
+      return opts;
+    },
+    /* 画质实时切换（Ruffle 播放器实例方法，无需重载游戏） */
+    rtApplyQuality() {
+      const p = this.rtPlayer;
+      if (!p) return;
+      if (this.rtQuality === "auto") {
+        this.clog("画质恢复自动（跟随 SWF 舞台设置，重新载入后完全生效）", "dim");
+        try { p.setQuality("high"); } catch (e) { /* 忽略 */ }
+        return;
+      }
+      try {
+        p.setQuality(this.rtQuality);
+        this.clog(`渲染画质已切换为 ${this.rtQuality}（实时生效）`, "ok");
+        this.showToast(`画质：${this.rtQuality}`, "ok");
+      } catch (e) {
+        this.clog("画质切换失败: " + e.message, "err");
+      }
+    },
     async rtLoadFrom(url, name, base, sessionId, expectedSize) {
       this.rtResWarn = "";
       this.rtLoading = true;
       this.rtLoadPct = null;
       this.rtLoadBytes = "";
       this.rtLoadStage = "加载模拟器…";
+      hookConsole(); // 加载窗口期启用日志捕获（资源失败检测）
       await loadRuffle();
       this.rtLoadStage = "初始化播放器…";
       this.rtPlayer = window.RufflePlayer.newest().createPlayer();
@@ -1085,8 +1302,8 @@ const app = createApp({
       // base：AVM1 相对资源（loadMovie 等）的解析基准，真实播放器默认为 SWF 所在目录
       this.rtLoadStage = "读取游戏文件…";
       const stopPoll = sessionId && expectedSize ? this.rtStartProgressPoll(sessionId, expectedSize) : null;
-      const minShow = new Promise(r => setTimeout(r, 1200)); // 遮罩最短显示，避免一闪而过
-      const opts = base ? { url, base, allowScriptAccess: false } : { url, allowScriptAccess: false };
+      const minShow = new Promise(r => setTimeout(r, 900)); // 遮罩最短显示，避免一闪而过
+      const opts = this.playerOpts(base ? { url, base } : { url });
       await this.rtPlayer.load(opts);
       this.rtLoadStage = "启动游戏…";
       await new Promise(r => setTimeout(r, 600)); // 留出首帧渲染
@@ -1102,45 +1319,10 @@ const app = createApp({
       this.rtName = name;
       this.rtStatus = `${name} 运行中`;
       this.clog(`游戏已运行：${name}。看到目标数值后：scan <值> → 游戏内改变它 → next <新值> → patch <序号> <值>`, "ok");
-      // 资源加载失败检测：文件模式无法解析相对路径时给出明确指引
+      // 资源加载失败检测：文件模式无法解析相对路径时给出明确指引；
+      // 检测窗口结束后恢复原始 console（运行期零拦截开销）
       setTimeout(() => this.rtCheckResError(), 4000);
-      setTimeout(() => this.rtCheckResError(), 9000);
-      // 自动重搜：游戏重载后自动扫描之前保存的数值
-      const pending = this.cheats.filter(c => c.lastValue !== undefined);
-      if (pending.length) {
-        setTimeout(async () => {
-          for (const c of pending) {
-            this.rtSearchValue = String(c.lastValue);
-            this.rtSearchType = c.type === 'i32' ? 'i32' : 'f64';
-            await this.rtSmartSearch();
-          }
-          this.showToast(`已自动重搜 ${pending.length} 项`, "ok");
-        }, 2000); // 等 Ruffle 稳定
-      }
-      // 自动重搜：游戏重载后自动扫描之前保存的数值
-      const cheatsToRefind = this.cheats.filter(c => c.lastValue !== undefined);
-      if (cheatsToRefind.length) {
-        this.showToast("自动重搜之前保存的数值…", "ok");
-        setTimeout(async () => {
-          let found = 0;
-          for (const c of cheatsToRefind) {
-            p.rtSearchValue = String(c.lastValue);
-            p.rtSearchType = c.type === 'i32' ? 'i32' : 'f64';
-            const before = rtState.hits ? rtState.hits.length : 0;
-            await p.rtSmartSearch();
-            const now = rtState.hits ? rtState.hits.length : 0;
-            if (now > 0) {
-              // 更新地址
-              if (now === 1) {
-                c.addr = rtState.hits[0].addr;
-                c.memId = rtState.hits[0].memId;
-              }
-              found++;
-            }
-          }
-          this.showToast(`自动重搜完成：${found}/${cheatsToRefind.length} 项已重新定位`, "ok");
-        }, 2000); // 等 Ruffle 稳定
-      }
+      setTimeout(() => { this.rtCheckResError(); unhookConsole(); }, 9000);
       // 修改表自动恢复（按游戏内容哈希）
       try {
         const buf = await (await fetch(url)).arrayBuffer();
@@ -1160,7 +1342,7 @@ const app = createApp({
         id: e.id || "r" + Date.now() + "_" + i + "_" + Math.floor(Math.random() * 100),
         memId: mid, cur: e.lock ? e.lockValue : null,
       }));
-      if (this.cheats.some(c => c.lock)) startCheatEngine();
+      syncCheatEngine();
       this.clog(`已从修改表恢复 ${this.cheats.length} 条清单项`, "ok");
       this.showToast(`已恢复 ${this.cheats.length} 条修改项`, "ok");
     },
@@ -1213,6 +1395,7 @@ const app = createApp({
       rtState.hits = null;
       rtState.unknown = null;
       this.rtStatus = "";
+      unhookConsole();
       this.clog("运行时会话已结束", "dim");
     },
     rtRead(h) {
@@ -1245,7 +1428,6 @@ const app = createApp({
         hits.push({ mem, addr, type: t, checked: false, last: value, cur: value });
         return hits.length >= RT_HIT_CAP;
       };
-      const sleep0 = () => new Promise(r => setTimeout(r, 0));
       let doneMB = 0;
       const YIELD = 1 << 21; // 每 ~200 万槽位让出主线程并回报进度
       const prog = (mb) => {
@@ -1261,9 +1443,9 @@ const app = createApp({
               this.clog(`命中过多，已截断到 ${RT_HIT_CAP}——先用更独特的值扫描`, "err");
               return hits;
             }
-            if (i % YIELD === 0) { prog((i * 8) / 1048576); await sleep0(); }
+            if (i % YIELD === 0) { prog((i * 8) / 1048576); await yieldTask(); }
           }
-          await sleep0();
+          await yieldTask();
           // 4 字节对齐补扫（跳过已扫过的 8 对齐位置；DataView 允许非 8 对齐偏移）
           const dv = new DataView(m.buffer);
           for (let off = 4; off + 8 <= m.buffer.byteLength; off += 8) {
@@ -1273,7 +1455,7 @@ const app = createApp({
               return hits;
             }
           }
-          await sleep0();
+          await yieldTask();
         }
       }
       if (type === "i32" || type === "auto") {
@@ -1284,7 +1466,7 @@ const app = createApp({
               this.clog(`命中过多，已截断到 ${RT_HIT_CAP}`, "err");
               return hits;
             }
-            if (i % YIELD === 0) { prog((i * 4) / 1048576); await sleep0(); }
+            if (i % YIELD === 0) { prog((i * 4) / 1048576); await yieldTask(); }
           }
         }
       }
@@ -1361,13 +1543,13 @@ const app = createApp({
             n++;
             if (n % YIELD_EVERY === 0) {
               this.rtScanInfo = `已扫描 ${doneMB + (i * step) / 1048576 | 0} / ${totalMB | 0} MB…`;
-              await new Promise(r => setTimeout(r, 0)); // 让出主线程，界面不冻
+              await yieldTask(); // 零延迟让出，界面不冻
             }
           }
           doneMB += m.buffer.byteLength / 1048576;
           total += n;
           chunks.push({ mem: m, type, addrs, last, n });
-          await new Promise(r => setTimeout(r, 0));
+          await yieldTask();
         }
         rtState.unknown = { type, chunks, total };
         this.clog(`未知初值扫描完成：候选 ${total} 处（${((performance.now() - t0) / 1000).toFixed(2)}s）。` +
@@ -1451,61 +1633,7 @@ const app = createApp({
           }
           if (w && (w % (1 << 20)) === 0) { // 每 ~100 万保留让出主线程
             this.rtScanInfo = `过滤中… 已保留 ${kept + w} 处`;
-            await new Promise(r => setTimeout(r, 0));
-          }
-        }
-        ch.n = w;
-        kept += w;
-      }
-      rtState.unknown.total = kept;
-      this.rtScanInfo = "";
-      this.clog(`缩小：${before} → ${kept} 处（${{ exact: "精确", inc: "变大了", dec: "变小了", changed: "变了" }[mode] || mode}）`, "ok");
-      this.rtTick++;
-    },
-    rtResetSearch() {
-      rtState.hits = null;
-      rtState.unknown = null;
-      this.rtTick++;
-      this.clog("已重置搜索", "dim");
-    },
-    async rtNarrowUnknown(mode) {
-      if (!rtState.unknown) return;
-      let value = null;
-      if (mode === "exact") {
-        try {
-          value = this.rtParseSearchValue();
-        } catch (e) {
-          this.rtErr = true;
-          this.rtStatus = "失败: " + e.message;
-          return;
-        }
-      }
-      let before = rtState.unknown.total;
-      let kept = 0;
-      this.rtScanInfo = "过滤中…";
-      for (const ch of rtState.unknown.chunks) {
-        const view = ch.type === "f64" ? new Float64Array(ch.mem.buffer) : new Int32Array(ch.mem.buffer);
-        let w = 0;
-        for (let k = 0; k < ch.n; k++) {
-          const addr = ch.addrs[k];
-          const cur = ch.type === "f64" ? view[addr >> 3] : view[addr >> 2];
-          if (Number.isNaN(cur)) continue;
-          let keep;
-          switch (mode) {
-            case "exact": keep = cur === value; break;
-            case "inc": keep = cur > ch.last[k]; break;
-            case "dec": keep = cur < ch.last[k]; break;
-            case "changed": keep = cur !== ch.last[k]; break;
-            case "same": keep = cur === ch.last[k]; break;
-          }
-          if (keep) {
-            ch.addrs[w] = addr;
-            ch.last[w] = cur;
-            w++;
-          }
-          if (w && (w % (1 << 20)) === 0) { // 每 ~100 万保留让出主线程
-            this.rtScanInfo = `过滤中… 已保留 ${kept + w} 处`;
-            await new Promise(r => setTimeout(r, 0));
+            await yieldTask();
           }
         }
         ch.n = w;
@@ -1555,7 +1683,7 @@ const app = createApp({
         cur: chainRead(m, best), lock: best.lock, lockValue: best.lockValue,
         delta: best.delta, hotkey: best.hotkey, hotkeyAdd: best.hotkeyAdd, hotkeyDec: best.hotkeyDec,
       });
-      startCheatEngine();
+      syncCheatEngine();
       this.saveCheatsSoon();
       this.ptTab = "cheats";
       this.notify(`已建立指针追踪（${best.slots.length} 级链）——重启游戏后自动追踪 ✓`);
@@ -1573,7 +1701,7 @@ const app = createApp({
         cur, lock: false, lockValue: cur,
         delta: 100, hotkey: "", hotkeyAdd: "", hotkeyDec: "",
       });
-      startCheatEngine();
+      syncCheatEngine();
       this.ptTab = "cheats";
       this.showToast(`已加入清单：0x${h.addr.toString(16)}`, "ok");
       this.freshId = id;
@@ -1597,6 +1725,7 @@ const app = createApp({
     },
     delCheat(id) {
       this.cheats = this.cheats.filter(c => c.id !== id);
+      syncCheatEngine();
       this.saveCheatsSoon();
     },
     toggleLock(c) {
@@ -1605,10 +1734,11 @@ const app = createApp({
         if (cur === null) { this.clog("地址已失效，无法锁定", "err"); return; }
         c.lockValue = cur;
         c.lock = true;
-        startCheatEngine();
+        syncCheatEngine();
         this.clog(`已锁定 ${c.desc || c.addr} = ${cur}（每 150ms 写回）`, "ok");
       } else {
         c.lock = false;
+        syncCheatEngine();
         this.saveCheatsSoon();
         this.notify(`已解锁 ${c.desc || c.addr}`);
       }
@@ -1866,33 +1996,48 @@ const app = createApp({
     document.addEventListener("fullscreenchange", () => {
       this.stageFs = !!document.fullscreenElement;
     });
+    this.syncTrainerDock();
   },
 });
 
-/* ---- 冻结引擎：150ms 写回锁定值；500ms 刷新清单当前值 ---- */
-let cheatEngineTimer = null;
-function startCheatEngine() {
-  if (cheatEngineTimer) return;
-  cheatEngineTimer = setInterval(() => {
-    const p = window.swfkit;
-    if (!p) return;
-    for (const c of p.cheats) {
-      if (c.lock) cheatWrite(c, c.lockValue);
-    }
-  }, 150);
-  // 清单当前值刷新
-  setInterval(() => {
-    const p2 = window.swfkit;
-    if (!p2) return;
-    let dirty = false;
-    for (const c of p2.cheats) {
-      if (p2.valFocusId === c.id) continue; // 用户正在编辑，不覆盖
-      const v = cheatRead(c);
-      if (v !== null && !c.lock && v !== c.cur) { c.cur = v; dirty = true; }
-      else if (v === null && c.cur !== null) { c.cur = null; dirty = true; }
-    }
-    if (dirty) p2.rtTick++;
-  }, 500);
+/* ---- 冻结引擎与清单刷新：按需运行 ----
+   150ms 写回锁定值（无锁定项时暂停）；500ms 刷新清单当前值
+   （清单为空或页面隐藏时跳过，避免空转打扰游戏主循环）。 */
+let freezeTimer = null;
+let refreshTimer = null;
+function syncCheatEngine() {
+  const p = window.swfkit;
+  const needFreeze = !!(p && p.cheats.some(c => c.lock));
+  if (needFreeze && !freezeTimer) {
+    freezeTimer = setInterval(() => {
+      const pp = window.swfkit;
+      if (!pp) return;
+      for (const c of pp.cheats) {
+        if (c.lock) cheatWrite(c, c.lockValue);
+      }
+    }, 150);
+  } else if (!needFreeze && freezeTimer) {
+    clearInterval(freezeTimer);
+    freezeTimer = null;
+  }
+  const needRefresh = !!(p && p.cheats.length);
+  if (needRefresh && !refreshTimer) {
+    refreshTimer = setInterval(() => {
+      const pp = window.swfkit;
+      if (!pp || !pp.cheats.length || document.hidden) return;
+      let dirty = false;
+      for (const c of pp.cheats) {
+        if (pp.valFocusId === c.id) continue; // 用户正在编辑，不覆盖
+        const v = cheatRead(c);
+        if (v !== null && !c.lock && v !== c.cur) { c.cur = v; dirty = true; }
+        else if (v === null && c.cur !== null) { c.cur = null; dirty = true; }
+      }
+      if (dirty) pp.rtTick++;
+    }, 500);
+  } else if (!needRefresh && refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
 }
 
 /* ---- 全局热键分发（捕获阶段，全屏/游戏聚焦均生效）---- */

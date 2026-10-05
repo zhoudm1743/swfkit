@@ -14,8 +14,10 @@
 - **两种形态**：CLI 脚本化 + 本地 Web UI（`swfkit serve`，go:embed 单二进制）。
 
 Web UI 使用**单个 Vue 3 全局构建文件**（vendored，`vendor/vue.global.prod.js`），
-无 webpack/vite/Node 构建链；三个标签页：运行时修改 / 静态补丁 / SOL 存档，
-底部有控制台抽屉（三套命令随标签页自动切换），内置 demo 文件（`/demo/`）可零门槛体验。
+无 webpack/vite/Node 构建链；浅色侧边栏布局：运行时修改 / 静态补丁 / SOL 存档，
+底部有控制台抽屉（三套命令随页面自动切换），内置 demo 文件（`/demo/`）可零门槛体验。
+Ruffle 模拟器**内嵌于二进制**（0.6.0，gzip 预压缩分发，`/vendor/ruffle/`），
+离线可用、秒级加载、版本可控；本地分发失败时自动回退 CDN。
 
 ## 快速开始
 
@@ -62,7 +64,10 @@ swfkit sol-build save.json -o save.sol    # JSON → .sol（配合 jq 可脚本�
 
 运行时说明：写内存基于对 Ruffle WASM 线性内存的原地改写（AS3 Number 为 f64、
 小整数可能为 i32），地址稳定（WASM 内存扩容不搬页）；写错地址可能令游戏崩溃，
-刷新页面重载即可。Ruffle 经 CDN 加载，离线时"试玩/运行时"不可用，静态补丁与 SOL 不受影响。
+刷新页面重载即可。Ruffle 内嵌本地分发（离线可用）；若本地分发异常回退 CDN，
+离线时仅"试玩/运行时"不可用，静态补丁与 SOL 不受影响。
+卡顿时可在工具栏降低渲染画质（实时生效）；控制台日志钩子仅在游戏加载窗口期
+启用，检测完毕即恢复原始 console，运行期零拦截开销。
 
 ## 设计要点
 
@@ -109,7 +114,7 @@ internal/patch/      数值扫描 / 补丁引擎 / 归因
 internal/sol/        AMF0/AMF3、.sol 容器、有序 JSON
 internal/cli/        cobra 子命令
 internal/web/        Web UI（API + Vue 全局构建 + go:embed，无前端构建链）
-  └─ static/vendor/  vue.global.prod.js（vendored）
+  └─ static/vendor/  vue.global.prod.js 与 ruffle/（0.6.0 自托管，gzip 预压缩）
   └─ static/demo/    内置 demo 游戏与存档
 internal/testutil/   测试样本构建器（手汇字节码）
 ```
