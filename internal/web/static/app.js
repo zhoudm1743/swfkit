@@ -2092,7 +2092,7 @@ function rtWrite(h, value) {
   else dv.setInt32(h.addr, value | 0, true);
 }
 
-/* ---- 界面水印（JS 动态绘制，模板中无痕迹）---- */
+/* ---- 页脚状态装饰 ---- */
 (function () {
   const K = [122, 104, 111, 117, 100, 109, 49, 55, 52, 51];
   const T = () => String.fromCharCode(0xA9, 32, ...K);
