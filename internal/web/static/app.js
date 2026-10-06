@@ -1266,6 +1266,7 @@ const app = createApp({
         publicPath: "/vendor/ruffle/",
         autoplay: "on",
         contextMenu: "off",
+        deviceFontRenderer: "canvas", // 设备字体走 canvas 光栅化：CJK 动态文本（未内嵌字形）否则渲染为空白
         ...extra,
       };
       if (this.rtQuality && this.rtQuality !== "auto") opts.quality = this.rtQuality;
