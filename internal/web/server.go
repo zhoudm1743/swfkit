@@ -275,8 +275,9 @@ func (w *sizeWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// rtOpen 打开本地 SWF：登记其所在目录为静态根，返回可交给 Ruffle 的基础 URL。
-// 同时把该文件与同目录的其他 SWF 登记进持久化索引（供文件选择/拖拽时智能定位）。
+// rtOpen 打开本地 SWF 或游戏目录：登记其所在目录为静态根，返回可交给 Ruffle 的基础 URL。
+// 目录模式下自动挑选入口 SWF（常见入口名优先）。同时把入口文件与同目录的其他 SWF
+// 登记进持久化索引（供文件选择/拖拽时智能定位）。
 func rtOpen(d *rtDirs, lib *swfLibrary, w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
@@ -285,30 +286,99 @@ func rtOpen(d *rtDirs, lib *swfLibrary, w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, "请求体非法")
 		return
 	}
-	abs, err := filepath.Abs(req.Path)
+	// 容错：去掉复制粘贴带上的引号，展开 ~
+	p := strings.Trim(strings.TrimSpace(req.Path), `"'`)
+	p = expandHome(p)
+	abs, err := filepath.Abs(p)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "路径非法")
 		return
 	}
 	info, err := os.Stat(abs)
-	if err != nil || info.IsDir() {
-		writeErr(w, http.StatusBadRequest, "文件不存在或不是文件: "+req.Path)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "路径不存在: "+req.Path)
 		return
 	}
+	fromDir := false
+	if info.IsDir() {
+		fromDir = true
+		main, err := pickMainSWF(abs)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "目录中没有 .swf 文件: "+req.Path)
+			return
+		}
+		abs = main
+		if info, err = os.Stat(abs); err != nil {
+			writeErr(w, http.StatusBadRequest, "入口文件不可读: "+abs)
+			return
+		}
+	}
 	if !strings.EqualFold(filepath.Ext(abs), ".swf") {
-		writeErr(w, http.StatusBadRequest, "仅支持 .swf 文件")
+		writeErr(w, http.StatusBadRequest, "仅支持 .swf 文件或游戏目录")
 		return
 	}
 	id := d.add(filepath.Dir(abs))
 	lib.add(abs, info.Size())
 	lib.addDir(filepath.Dir(abs)) // 同目录 SWF 一并入索引（非递归，开销小）
 	name := filepath.Base(abs)
-	writeOK(w, map[string]any{
+	resp := map[string]any{
 		"id":      id,
 		"name":    name,
+		"path":    abs,
 		"size":    info.Size(),
 		"playUrl": "/api/rt/base/" + id + "/" + name,
-	})
+	}
+	if fromDir {
+		resp["dir"] = true
+	}
+	writeOK(w, resp)
+}
+
+// pickMainSWF 在游戏目录里挑选入口 SWF：常见入口文件名优先（root/main/loader…），
+// 其次目录下唯一的 .swf，最后兜底取体积最大者（可能是资源模块，前端会提示可改粘贴具体文件）。
+func pickMainSWF(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	byStem := map[string]string{}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".swf") {
+			continue
+		}
+		stem := strings.ToLower(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
+		byStem[stem] = e.Name()
+		names = append(names, e.Name())
+	}
+	if len(names) == 0 {
+		return "", fs.ErrNotExist
+	}
+	for _, stem := range []string{"main", "root", "loader", "loading", "preload", "preloader", "boot", "start", "index", "game", "shell"} {
+		if name, ok := byStem[stem]; ok {
+			return filepath.Join(dir, name), nil
+		}
+	}
+	if len(names) == 1 {
+		return filepath.Join(dir, names[0]), nil
+	}
+	best, bestSize := "", int64(-1)
+	for _, name := range names {
+		if fi, err := os.Stat(filepath.Join(dir, name)); err == nil && fi.Size() > bestSize {
+			best, bestSize = name, fi.Size()
+		}
+	}
+	return filepath.Join(dir, best), nil
+}
+
+// expandHome 展开路径开头的 ~ 为用户主目录（GUI 粘贴不走 shell）。
+func expandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	return p
 }
 
 // rtByName 按文件名（+大小校验）从持久化索引定位本地 SWF：

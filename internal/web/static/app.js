@@ -432,7 +432,7 @@ const TEMPLATE = `
         <div class="card" :class="{ dropzone: true, dragging: rtDragging }">
           <div class="toolbar">
             <label class="file-btn" :class="{ 'has-file': rtFile }">📂 {{ rtFile ? rtFile.name : '选择 SWF 文件' }}<input type="file" accept=".swf" ref="rtFileInput" @change="onRtFilePicked"></label>
-            <input v-model="rtPath" class="path-input" placeholder="或粘贴本地 .swf 路径（游戏目录内相对资源完整支持）" spellcheck="false" @keydown.enter="loadMain">
+            <input v-model="rtPath" class="path-input" placeholder="或粘贴本地 .swf 路径 / 游戏目录（目录内相对资源完整支持）" spellcheck="false" @keydown.enter="loadMain">
             <button class="primary" @click="loadMain">载入</button>
             <button @click="loadDemo('rt')">体验 demo</button>
             <span class="spacer"></span>
@@ -1200,7 +1200,10 @@ const app = createApp({
       try {
         const res = await api("POST", "/api/rt/open", { path: p });
         localStorage.setItem("swfkit.rtPath", p); // 记住路径，下次自动填好
-        this.clog(`已打开 ${res.name}（${(res.size / 1048576).toFixed(1)} MB），相对资源按其目录解析`, "dim");
+        const sizeTxt = `（${(res.size / 1048576).toFixed(1)} MB）`;
+        this.clog(res.dir
+          ? `已打开目录，入口 ${res.name}${sizeTxt}，相对资源按目录解析（若入口识别有误，请粘贴具体 .swf 文件路径）`
+          : `已打开 ${res.name}${sizeTxt}，相对资源按其目录解析`, "dim");
         const base = res.playUrl.slice(0, res.playUrl.lastIndexOf("/") + 1);
         await this.rtLoadFrom(res.playUrl, res.name, base, res.id, res.size);
       } catch (e) {
